@@ -1,0 +1,90 @@
+name: Build FAP Moderno + Alertas
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["src/**", "tools/**", ".github/workflows/build.yml", "*.apk"]
+
+env:
+  APK_IN: FAP_Moderno_1_0_2.apk
+  APKTOOL_VERSION: "2.10.0"
+  JAVA_TOOL_OPTIONS: "-Xmx5g"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Localizar Android SDK (build-tools e android.jar)
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          PLAT=$(ls -d "$ANDROID_HOME"/platforms/android-* | sort -V | tail -1)
+          echo "BT=$BT" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$PLAT/android.jar" >> "$GITHUB_ENV"
+          echo "build-tools: $BT | platform: $PLAT"
+
+      - name: Baixar apktool
+        run: curl -fsSL -o apktool.jar "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+
+      - name: Compilar classes de alerta (javac + d8)
+        run: |
+          mkdir -p build/classes build/dex
+          javac --release 8 -encoding UTF-8 -cp "$ANDROID_JAR" -d build/classes $(find src -name '*.java')
+          "$BT/d8" --lib "$ANDROID_JAR" --min-api 24 --output build/dex $(find build/classes -name '*.class')
+          ls -l build/dex
+
+      - name: Decodificar APK original (sem decompilar dex)
+        run: java -jar apktool.jar d -s -f "$APK_IN" -o build/decoded
+
+      - name: Extrair so o dex do app e decodificar para smali
+        run: |
+          DEX=$(python3 tools/fap_patch.py locate build/decoded)
+          echo "DEX=$DEX" >> "$GITHUB_ENV"
+          echo "dex do app: $DEX"
+          python3 tools/fap_patch.py stub build/decoded "$DEX" build/stub.apk
+          java -jar apktool.jar d -r -f --api 34 build/stub.apk -o build/stub_dec
+          ls build/stub_dec
+
+      - name: Aplicar patches (smali + manifest)
+        run: |
+          python3 tools/fap_patch.py smali build/stub_dec
+          python3 tools/fap_patch.py manifest build/decoded
+
+      - name: Reassemblar dex patchado e APK
+        run: |
+          java -jar apktool.jar b -f --api 34 build/stub_dec -o build/stub_patched.apk
+          java -jar apktool.jar b -f build/decoded -o build/built.apk
+          python3 tools/fap_patch.py inject build/built.apk build/stub_patched.apk build/dex/classes.dex build/merged.apk "$DEX"
+
+      - name: Alinhar e assinar
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          mkdir -p out
+          "$BT/zipalign" -p -f 4 build/merged.apk build/aligned.apk
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > build/release.jks
+            KS=build/release.jks; PASS="$KS_PASS"; ALIAS="$KS_ALIAS"
+          else
+            echo "::warning::Sem secrets de keystore: usando chave temporaria (cada build tera assinatura diferente; desinstale a versao anterior antes de instalar)."
+            keytool -genkeypair -keystore build/tmp.jks -storepass android -keypass android -alias fap \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=FAP Alertas"
+            KS=build/tmp.jks; PASS=android; ALIAS=fap
+          fi
+          "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$PASS" --key-pass "pass:$PASS" --ks-key-alias "$ALIAS" \
+            --out out/FAP_Moderno_Alertas.apk build/aligned.apk
+          "$BT/apksigner" verify --verbose out/FAP_Moderno_Alertas.apk | head -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FAP_Moderno_Alertas
+          path: out/FAP_Moderno_Alertas.apk
